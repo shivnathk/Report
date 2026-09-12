@@ -1,33 +1,27 @@
 # ============================================================
-# Azure VM Charged Hours Report
+# Azure VM Charged Usage Report
 #
 # Gets ALL VMs in a subscription and matches them against
 # Azure Cost Management usage data.
 #
-# Report columns:
-#   VMName
-#   ResourceGroup
+# Reports:
+#   VM Name
+#   Resource Group
 #   Location
-#   VMSize
-#   ReportingDays
-#   ChargedHours
-#   ChargedDays
+#   VM Size
+#   Reporting Days
+#   Charged Hours
+#   Charged Days
 #   Cost
 #   Currency
 #
 # Requirements:
 #   Az.Accounts
 #   Az.Compute
-#   Az.CostManagement
 #
-# Example:
-#
-# .\Get-AzureVMChargedHours.ps1 `
-#     -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-#     -Days 10
 # ============================================================
 
-param(
+param (
     [Parameter(Mandatory = $true)]
     [string]$SubscriptionId,
 
@@ -63,7 +57,7 @@ $EndDate = [DateTime]::UtcNow
 $StartDate = $EndDate.AddDays(-$Days)
 
 Write-Host ""
-Write-Host "Reporting Period (UTC)" -ForegroundColor Cyan
+Write-Host "Reporting period (UTC)" -ForegroundColor Cyan
 Write-Host "Start : $StartDate"
 Write-Host "End   : $EndDate"
 Write-Host "Days  : $Days"
@@ -73,23 +67,19 @@ Write-Host ""
 # 3. Get ALL VMs
 # ============================================================
 
-Write-Host "Getting all VMs from Azure Compute..." -ForegroundColor Cyan
+Write-Host "Getting all VMs..." -ForegroundColor Cyan
 
 $vms = Get-AzVM
 
 Write-Host "VMs found: $($vms.Count)" -ForegroundColor Green
 
 if ($vms.Count -eq 0) {
-
-    Write-Host ""
-    Write-Host "No VMs found in this subscription." `
-        -ForegroundColor Yellow
-
+    Write-Host "No VMs found." -ForegroundColor Yellow
     exit
 }
 
 # ============================================================
-# 4. Create VM lookup table
+# 4. Build VM lookup
 # ============================================================
 
 $vmLookup = @{}
@@ -99,102 +89,138 @@ foreach ($vm in $vms) {
     $resourceId = $vm.Id.ToLower()
 
     $vmLookup[$resourceId] = [PSCustomObject]@{
-
-        VMName        = $vm.Name
-        ResourceGroup = $vm.ResourceGroupName
-        Location      = $vm.Location
-        VMSize        = $vm.HardwareProfile.VmSize
-        ResourceId    = $vm.Id
-
-        ChargedQuantity = 0
-        Cost            = 0
+        VMName          = $vm.Name
+        ResourceGroup   = $vm.ResourceGroupName
+        Location        = $vm.Location
+        VMSize          = $vm.HardwareProfile.VmSize
+        ResourceId      = $vm.Id
+        ChargedHours    = 0.0
+        Cost            = 0.0
         Currency        = ""
     }
 }
 
 # ============================================================
-# 5. Query Azure Cost Management
+# 5. Get Azure access token
+# ============================================================
+
+Write-Host ""
+Write-Host "Getting Azure access token..." -ForegroundColor Cyan
+
+$token = (Get-AzAccessToken `
+    -ResourceUrl "https://management.azure.com/").Token
+
+$headers = @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+# ============================================================
+# 6. Cost Management API URL
+# ============================================================
+
+$scope = "/subscriptions/$SubscriptionId"
+
+$url = "https://management.azure.com$($scope)/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
+
+# ============================================================
+# 7. Build Cost Management query
+# ============================================================
+
+$body = @{
+    type = "Usage"
+
+    timeframe = "Custom"
+
+    timePeriod = @{
+        from = $StartDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        to   = $EndDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+
+    dataset = @{
+        granularity = "Daily"
+
+        aggregation = @{
+            totalCost = @{
+                name = "PreTaxCost"
+                function = "Sum"
+            }
+
+            totalQuantity = @{
+                name = "UsageQuantity"
+                function = "Sum"
+            }
+        }
+
+        grouping = @(
+            @{
+                type = "Dimension"
+                name = "ResourceId"
+            },
+
+            @{
+                type = "Dimension"
+                name = "Meter"
+            },
+
+            @{
+                type = "Dimension"
+                name = "UnitOfMeasure"
+            }
+        )
+    }
+}
+
+$jsonBody = $body | ConvertTo-Json -Depth 10
+
+# ============================================================
+# 8. Call Cost Management
 # ============================================================
 
 Write-Host ""
 Write-Host "Querying Azure Cost Management..." -ForegroundColor Cyan
 
-$scope = "/subscriptions/$SubscriptionId"
-
-$grouping = @(
-    New-AzCostManagementQueryGroupingObject `
-        -Type Dimension `
-        -Name "ResourceId"
-)
-
-$aggregation = @{
-
-    totalQuantity = @{
-        Name     = "UsageQuantity"
-        Function = "Sum"
-    }
-
-    totalCost = @{
-        Name     = "PreTaxCost"
-        Function = "Sum"
-    }
-}
-
-$result = Invoke-AzCostManagementQuery `
-    -Scope $scope `
-    -Type "Usage" `
-    -Timeframe "Custom" `
-    -TimePeriodFrom $StartDate `
-    -TimePeriodTo $EndDate `
-    -DatasetGranularity "Daily" `
-    -DatasetGrouping $grouping `
-    -DatasetAggregation $aggregation
+$response = Invoke-RestMethod `
+    -Method Post `
+    -Uri $url `
+    -Headers $headers `
+    -Body $jsonBody
 
 Write-Host "Cost Management query completed." `
     -ForegroundColor Green
 
 # ============================================================
-# 6. Identify Cost Management columns
+# 9. Process Cost Management results
 # ============================================================
 
-$resourceIdIndex = -1
-$quantityIndex   = -1
-$costIndex       = -1
-$currencyIndex   = -1
+$columns = @()
 
-for ($i = 0; $i -lt $result.Column.Count; $i++) {
-
-    switch ($result.Column[$i].Name) {
-
-        "ResourceId" {
-            $resourceIdIndex = $i
-        }
-
-        "UsageQuantity" {
-            $quantityIndex = $i
-        }
-
-        "PreTaxCost" {
-            $costIndex = $i
-        }
-
-        "Currency" {
-            $currencyIndex = $i
-        }
-    }
+foreach ($column in $response.properties.columns) {
+    $columns += $column.name
 }
 
-# ============================================================
-# 7. Match Cost Management data to VMs
-# ============================================================
-
 Write-Host ""
-Write-Host "Matching Cost Management records to VMs..." `
-    -ForegroundColor Cyan
+Write-Host "Columns returned by Azure:" -ForegroundColor Cyan
+Write-Host ($columns -join ", ")
+Write-Host ""
 
-if ($result.Row) {
+# ------------------------------------------------------------
+# Find column positions
+# ------------------------------------------------------------
 
-    foreach ($row in $result.Row) {
+$resourceIdIndex = $columns.IndexOf("ResourceId")
+$meterIndex      = $columns.IndexOf("Meter")
+$unitIndex       = $columns.IndexOf("UnitOfMeasure")
+$quantityIndex   = $columns.IndexOf("UsageQuantity")
+$costIndex       = $columns.IndexOf("PreTaxCost")
+
+# ============================================================
+# 10. Process rows
+# ============================================================
+
+if ($response.properties.rows) {
+
+    foreach ($row in $response.properties.rows) {
 
         if ($resourceIdIndex -lt 0) {
             continue
@@ -208,58 +234,87 @@ if ($result.Row) {
 
         $resourceIdLower = $resourceId.ToLower()
 
+        # ----------------------------------------------------
         # Only Azure VM resources
-        if ($resourceIdLower -notmatch `
-            "/providers/microsoft\.compute/virtualmachines/") {
+        # ----------------------------------------------------
 
+        if ($resourceIdLower -notmatch `
+            "/providers/microsoft.compute/virtualmachines/") {
             continue
         }
 
-        # Match with VM inventory
-        if ($vmLookup.ContainsKey($resourceIdLower)) {
+        # ----------------------------------------------------
+        # Check that this is an hourly meter
+        # ----------------------------------------------------
 
-            $vmRecord = $vmLookup[$resourceIdLower]
+        $meter = ""
 
-            # Usage quantity
-            if ($quantityIndex -ge 0 -and
-                $null -ne $row[$quantityIndex]) {
+        if ($meterIndex -ge 0) {
+            $meter = [string]$row[$meterIndex]
+        }
 
-                $vmRecord.ChargedQuantity += `
-                    [double]$row[$quantityIndex]
+        $unit = ""
+
+        if ($unitIndex -ge 0) {
+            $unit = [string]$row[$unitIndex]
+        }
+
+        # Only process hour-based VM usage
+        if ($unit -notmatch "(?i)hour") {
+            continue
+        }
+
+        # ----------------------------------------------------
+        # Find matching VM
+        # ----------------------------------------------------
+
+        if (-not $vmLookup.ContainsKey($resourceIdLower)) {
+            continue
+        }
+
+        $vmRecord = $vmLookup[$resourceIdLower]
+
+        # ----------------------------------------------------
+        # Usage quantity
+        # ----------------------------------------------------
+
+        if ($quantityIndex -ge 0) {
+
+            if ($null -ne $row[$quantityIndex]) {
+
+                $quantity = [double]$row[$quantityIndex]
+
+                $vmRecord.ChargedHours += $quantity
             }
+        }
 
-            # Cost
-            if ($costIndex -ge 0 -and
-                $null -ne $row[$costIndex]) {
+        # ----------------------------------------------------
+        # Cost
+        # ----------------------------------------------------
 
-                $vmRecord.Cost += `
-                    [double]$row[$costIndex]
-            }
+        if ($costIndex -ge 0) {
 
-            # Currency
-            if ($currencyIndex -ge 0 -and
-                $null -ne $row[$currencyIndex]) {
+            if ($null -ne $row[$costIndex]) {
 
-                $vmRecord.Currency = `
-                    [string]$row[$currencyIndex]
+                $cost = [double]$row[$costIndex]
+
+                $vmRecord.Cost += $cost
             }
         }
     }
 }
 
 # ============================================================
-# 8. Create final report
+# 11. Create final report
 # ============================================================
 
 $report = foreach ($vmRecord in $vmLookup.Values) {
 
-    # Quantity returned by Cost Management
     $chargedHours = [math]::Round(
-        $vmRecord.ChargedQuantity,
+        $vmRecord.ChargedHours,
         4
     )
 
-    # Convert hours to days
     $chargedDays = [math]::Round(
         ($chargedHours / 24),
         4
@@ -267,22 +322,19 @@ $report = foreach ($vmRecord in $vmLookup.Values) {
 
     [PSCustomObject]@{
 
-        VMName        = $vmRecord.VMName
+        VMName = $vmRecord.VMName
 
         ResourceGroup = $vmRecord.ResourceGroup
 
-        Location      = $vmRecord.Location
+        Location = $vmRecord.Location
 
-        VMSize        = $vmRecord.VMSize
+        VMSize = $vmRecord.VMSize
 
-        # Requested reporting window
         ReportingDays = $Days
 
-        # Azure usage quantity
-        ChargedHours  = $chargedHours
+        ChargedHours = $chargedHours
 
-        # ChargedHours / 24
-        ChargedDays   = $chargedDays
+        ChargedDays = $chargedDays
 
         Cost = [math]::Round(
             $vmRecord.Cost,
@@ -295,16 +347,19 @@ $report = foreach ($vmRecord in $vmLookup.Values) {
     }
 }
 
-$report = $report |
-    Sort-Object VMName
+# ============================================================
+# 12. Sort report
+# ============================================================
+
+$report = $report | Sort-Object VMName
 
 # ============================================================
-# 9. Display report
+# 13. Display
 # ============================================================
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host "AZURE VM CHARGED USAGE REPORT"
+Write-Host "AZURE VM CHARGED HOURS REPORT"
 Write-Host "============================================================"
 Write-Host ""
 
@@ -322,7 +377,7 @@ $report |
         -AutoSize
 
 # ============================================================
-# 10. Export CSV
+# 14. Export CSV
 # ============================================================
 
 $report |
@@ -338,6 +393,6 @@ Write-Host "============================================================"
 
 Write-Host "Total VMs      : $($report.Count)"
 Write-Host "Reporting Days : $Days"
-Write-Host "CSV File       : $OutputCsv" -ForegroundColor Green
+Write-Host "Output CSV     : $OutputCsv" -ForegroundColor Green
 
 Write-Host "============================================================"
