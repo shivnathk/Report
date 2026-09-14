@@ -1,13 +1,20 @@
 # ============================================================
 # Azure VM Charged Usage Report
 #
-# Gets:
-#   - ALL VMs in subscription
-#   - Cost Management usage for last N days
-#   - Matches using ResourceId
-#   - Charged Hours
-#   - Charged Days
-#   - Cost
+# Purpose:
+#   - Gets ALL VMs in subscription
+#   - Queries Cost Management usage for last N days
+#   - Matches usage using ResourceId
+#   - Calculates VM compute charged hours
+#   - Calculates charged days
+#   - Calculates cost
+#
+# IMPORTANT:
+#   UsageQuantity is NOT automatically VM hours.
+#   This script therefore:
+#     1. Groups by ResourceId + Meter + UnitOfMeasure
+#     2. Only counts hour-based VM compute usage
+#     3. Does NOT add disk/network/other quantities as hours
 #
 # Requirements:
 #   Az.Accounts
@@ -20,6 +27,7 @@ param (
     [string]$SubscriptionId,
 
     [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 365)]
     [int]$Days = 10,
 
     [Parameter(Mandatory = $false)]
@@ -52,11 +60,8 @@ Set-AzContext `
 $context = Get-AzContext
 
 Write-Host ""
-Write-Host "Subscription : $($context.Subscription.Name)" `
-    -ForegroundColor Green
-
-Write-Host "Subscription ID : $($context.Subscription.Id)" `
-    -ForegroundColor Green
+Write-Host "Subscription    : $($context.Subscription.Name)" -ForegroundColor Green
+Write-Host "Subscription ID : $($context.Subscription.Id)" -ForegroundColor Green
 
 # ============================================================
 # 3. Date range
@@ -65,11 +70,14 @@ Write-Host "Subscription ID : $($context.Subscription.Id)" `
 $EndDate = [DateTime]::UtcNow
 $StartDate = $EndDate.AddDays(-$Days)
 
+$MaximumHours = $Days * 24
+
 Write-Host ""
 Write-Host "Reporting period (UTC)" -ForegroundColor Cyan
-Write-Host "Start : $StartDate"
-Write-Host "End   : $EndDate"
-Write-Host "Days  : $Days"
+Write-Host "Start          : $StartDate"
+Write-Host "End            : $EndDate"
+Write-Host "Reporting Days : $Days"
+Write-Host "Maximum Hours  : $MaximumHours"
 
 # ============================================================
 # 4. Get ALL VMs
@@ -78,7 +86,7 @@ Write-Host "Days  : $Days"
 Write-Host ""
 Write-Host "Getting all VMs..." -ForegroundColor Cyan
 
-$vms = Get-AzVM
+$vms = @(Get-AzVM)
 
 Write-Host "VMs found: $($vms.Count)" -ForegroundColor Green
 
@@ -122,8 +130,7 @@ foreach ($vm in $vms) {
 # ============================================================
 
 Write-Host ""
-Write-Host "Getting Azure Resource Manager token..." `
-    -ForegroundColor Cyan
+Write-Host "Getting Azure Resource Manager token..." -ForegroundColor Cyan
 
 $accessToken = Get-AzAccessToken `
     -ResourceUrl "https://management.azure.com/" `
@@ -167,10 +174,13 @@ $scope = "/subscriptions/$SubscriptionId"
 $url = "https://management.azure.com$($scope)/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
 
 # ============================================================
-# 8. IMPORTANT:
-#    Group ONLY by ResourceId
+# 8. Cost Management query
 #
-#    Do NOT group by Meter or UnitOfMeasure.
+# IMPORTANT:
+#   We DO NOT group only by ResourceId.
+#
+#   Meter and UnitOfMeasure are included so that we can
+#   distinguish compute hours from other resource charges.
 # ============================================================
 
 $body = @{
@@ -184,9 +194,11 @@ $body = @{
     }
 
     dataset = @{
+
         granularity = "Daily"
 
         aggregation = @{
+
             totalCost = @{
                 name = "PreTaxCost"
                 function = "Sum"
@@ -202,6 +214,14 @@ $body = @{
             @{
                 type = "Dimension"
                 name = "ResourceId"
+            },
+            @{
+                type = "Dimension"
+                name = "Meter"
+            },
+            @{
+                type = "Dimension"
+                name = "UnitOfMeasure"
             }
         )
     }
@@ -244,8 +264,7 @@ catch {
     throw
 }
 
-Write-Host "Cost Management query successful." `
-    -ForegroundColor Green
+Write-Host "Cost Management query successful." -ForegroundColor Green
 
 # ============================================================
 # 10. Read columns
@@ -254,7 +273,6 @@ Write-Host "Cost Management query successful." `
 $columns = @()
 
 foreach ($column in $response.properties.columns) {
-
     $columns += [string]$column.name
 }
 
@@ -267,10 +285,10 @@ Write-Host ($columns -join ", ")
 # ============================================================
 
 $resourceIdIndex = $columns.IndexOf("ResourceId")
-
-$quantityIndex = $columns.IndexOf("UsageQuantity")
-
-$costIndex = $columns.IndexOf("PreTaxCost")
+$quantityIndex   = $columns.IndexOf("UsageQuantity")
+$costIndex       = $columns.IndexOf("PreTaxCost")
+$meterIndex      = $columns.IndexOf("Meter")
+$unitIndex       = $columns.IndexOf("UnitOfMeasure")
 
 # ============================================================
 # 12. Validate
@@ -288,15 +306,26 @@ if ($costIndex -lt 0) {
     throw "PreTaxCost was not returned by Cost Management."
 }
 
+if ($meterIndex -lt 0) {
+    throw "Meter was not returned by Cost Management."
+}
+
+if ($unitIndex -lt 0) {
+    throw "UnitOfMeasure was not returned by Cost Management."
+}
+
 # ============================================================
 # 13. Process Cost Management rows
 # ============================================================
 
 Write-Host ""
-Write-Host "Matching Cost Management data..." `
-    -ForegroundColor Cyan
+Write-Host "Processing Cost Management data..." -ForegroundColor Cyan
 
 $matchedRecords = 0
+$computeRecords = 0
+
+# Keep a diagnostic list of meters encountered.
+$meterDiagnostics = @()
 
 if ($response.properties.rows) {
 
@@ -310,39 +339,124 @@ if ($response.properties.rows) {
 
         $resourceIdLower = $resourceId.ToLowerInvariant()
 
+        # ----------------------------------------------------
         # Only VM resources
+        # ----------------------------------------------------
+
         if ($resourceIdLower -notmatch `
             "/providers/microsoft.compute/virtualmachines/") {
 
             continue
         }
 
+        # ----------------------------------------------------
         # Match against VM inventory
+        # ----------------------------------------------------
+
         if (-not $vmLookup.ContainsKey($resourceIdLower)) {
             continue
         }
 
         $vmRecord = $vmLookup[$resourceIdLower]
 
+        $meter = [string]$row[$meterIndex]
+        $unit   = [string]$row[$unitIndex]
+
         # ----------------------------------------------------
-        # Usage quantity
+        # Save diagnostic information
         # ----------------------------------------------------
 
-        if ($null -ne $row[$quantityIndex]) {
+        $meterDiagnostics += [PSCustomObject]@{
+            VMName        = $vmRecord.VMName
+            Meter         = $meter
+            UnitOfMeasure = $unit
+        }
 
-            $quantity = 0.0
+        $matchedRecords++
 
-            if ([double]::TryParse(
-                [string]$row[$quantityIndex],
-                [ref]$quantity
-            )) {
+        # ====================================================
+        # IMPORTANT
+        #
+        # Only count actual hour-based usage as ChargedHours.
+        #
+        # We deliberately DO NOT treat arbitrary UsageQuantity
+        # as hours.
+        # ====================================================
 
-                $vmRecord.ChargedHours += $quantity
+        $isHourUnit = $false
+
+        switch -Regex ($unit.ToLowerInvariant()) {
+
+            "^hours?$" {
+                $isHourUnit = $true
+            }
+
+            "^hour(s)?$" {
+                $isHourUnit = $true
+            }
+
+            "^1/hour$" {
+                $isHourUnit = $true
+            }
+
+            default {
+                $isHourUnit = $false
+            }
+        }
+
+        # ----------------------------------------------------
+        # Compute meter detection
+        #
+        # Azure meter names vary by VM type/region.
+        #
+        # We require the meter to look like VM/compute usage.
+        # ----------------------------------------------------
+
+        $isComputeMeter = $false
+
+        $meterLower = $meter.ToLowerInvariant()
+
+        if (
+            ($meterLower -match "virtual machine") -or
+            ($meterLower -match "compute") -or
+            ($meterLower -match "instance") -or
+            ($meterLower -match "vm ")
+        ) {
+            $isComputeMeter = $true
+        }
+
+        # ----------------------------------------------------
+        # Add quantity only when it looks like compute hours.
+        # ----------------------------------------------------
+
+        if ($isHourUnit -and $isComputeMeter) {
+
+            if ($null -ne $row[$quantityIndex]) {
+
+                $quantity = 0.0
+
+                if ([double]::TryParse(
+                    [string]$row[$quantityIndex],
+                    [Globalization.NumberStyles]::Any,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$quantity
+                )) {
+
+                    $vmRecord.ChargedHours += $quantity
+
+                    $computeRecords++
+                }
             }
         }
 
         # ----------------------------------------------------
         # Cost
+        #
+        # Cost is kept separately from hours.
+        # All VM-resource costs are included here.
+        #
+        # If you want ONLY compute cost, move this calculation
+        # inside the compute-meter condition above.
         # ----------------------------------------------------
 
         if ($null -ne $row[$costIndex]) {
@@ -351,23 +465,49 @@ if ($response.properties.rows) {
 
             if ([double]::TryParse(
                 [string]$row[$costIndex],
+                [Globalization.NumberStyles]::Any,
+                [Globalization.CultureInfo]::InvariantCulture,
                 [ref]$cost
             )) {
 
                 $vmRecord.Cost += $cost
             }
         }
-
-        $matchedRecords++
     }
 }
 
-Write-Host ""
-Write-Host "Matched records: $matchedRecords" `
-    -ForegroundColor Green
+# ============================================================
+# 14. Protect against impossible hours
+# ============================================================
+
+foreach ($vmRecord in $vmLookup.Values) {
+
+    if ($vmRecord.ChargedHours -gt $MaximumHours) {
+
+        Write-Host ""
+        Write-Host "WARNING:" -ForegroundColor Yellow
+
+        Write-Host `
+            "$($vmRecord.VMName) has $($vmRecord.ChargedHours) hours, " +
+            "which exceeds the maximum $MaximumHours hours."
+
+        Write-Host `
+            "This indicates the Cost Management rows are not pure VM " +
+            "runtime hours."
+
+        # Do NOT silently report an impossible number.
+        #
+        # Set to maximum possible hours.
+        $vmRecord.ChargedHours = $MaximumHours
+    }
+
+    if ($vmRecord.ChargedHours -lt 0) {
+        $vmRecord.ChargedHours = 0
+    }
+}
 
 # ============================================================
-# 14. Create report
+# 15. Create report
 # ============================================================
 
 $report = foreach ($vmRecord in $vmLookup.Values) {
@@ -394,6 +534,8 @@ $report = foreach ($vmRecord in $vmLookup.Values) {
 
         ReportingDays = $Days
 
+        MaximumPossibleHours = $MaximumHours
+
         ChargedHours = $chargedHours
 
         ChargedDays = $chargedDays
@@ -410,14 +552,14 @@ $report = foreach ($vmRecord in $vmLookup.Values) {
 }
 
 # ============================================================
-# 15. Sort
+# 16. Sort
 # ============================================================
 
 $report = $report |
     Sort-Object VMName
 
 # ============================================================
-# 16. Display
+# 17. Display
 # ============================================================
 
 Write-Host ""
@@ -433,6 +575,7 @@ $report |
         Location,
         VMSize,
         ReportingDays,
+        MaximumPossibleHours,
         ChargedHours,
         ChargedDays,
         Cost,
@@ -440,7 +583,7 @@ $report |
         -AutoSize
 
 # ============================================================
-# 17. Export CSV
+# 18. Export CSV
 # ============================================================
 
 $report |
@@ -450,7 +593,25 @@ $report |
         -Encoding UTF8
 
 # ============================================================
-# 18. Summary
+# 19. Diagnostic meter report
+#
+# This is VERY useful for finding out why Azure returned
+# quantities that previously produced values such as 293 hours.
+# ============================================================
+
+$diagnosticCsv = Join-Path `
+    (Split-Path $OutputCsv -Parent) `
+    "Azure-VM-Meter-Diagnostics.csv"
+
+$meterDiagnostics |
+    Sort-Object VMName, Meter, UnitOfMeasure -Unique |
+    Export-Csv `
+        -Path $diagnosticCsv `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+# ============================================================
+# 20. Summary
 # ============================================================
 
 $totalHours = (
@@ -472,12 +633,15 @@ Write-Host "============================================================"
 Write-Host "SUMMARY"
 Write-Host "============================================================"
 
-Write-Host "Total VMs      : $($report.Count)"
-Write-Host "Reporting Days : $Days"
-Write-Host "Total Hours    : $([math]::Round($totalHours, 2))"
-Write-Host "Total Days     : $([math]::Round(($totalHours / 24), 2))"
-Write-Host "Total Cost     : $([math]::Round($totalCost, 2))"
+Write-Host "Total VMs            : $($report.Count)"
+Write-Host "Reporting Days       : $Days"
+Write-Host "Maximum Hours / VM   : $MaximumHours"
+Write-Host "Compute Records      : $computeRecords"
+Write-Host "Matched VM Records   : $matchedRecords"
+Write-Host "Total Hours          : $([math]::Round($totalHours, 2))"
+Write-Host "Total Days           : $([math]::Round(($totalHours / 24), 2))"
+Write-Host "Total Cost           : $([math]::Round($totalCost, 2))"
 Write-Host ""
-Write-Host "CSV             : $OutputCsv" -ForegroundColor Green
-
+Write-Host "CSV                  : $OutputCsv" -ForegroundColor Green
+Write-Host "Meter Diagnostics    : $diagnosticCsv" -ForegroundColor Green
 Write-Host "============================================================"
