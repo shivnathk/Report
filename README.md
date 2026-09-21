@@ -1,21 +1,25 @@
 Heartbeat
-| where TimeGenerated >= ago(90d)
+|summarize LastHearbeat=max(TimeGenerated) by Computer
+|Join kind=leftouter (
+	Event
+	|where EventLog == "System"
+	|where Source == "Microsoft-Windows-Kernel-General"
+	|where EventID == 12
+	|summarize LastBoot=max(TimeGenerated) by Computer
+) on Computer
+|extend UptimeHours = round(datetime_diff('minute',LastHeatbeat,LastBoot) / -60.0,2)
+``
+---------------------
+Heartbeat
 | summarize
-    FirstHeartbeat = min(TimeGenerated),
-    LastHeartbeat = max(TimeGenerated),
-    HeartbeatCount = count()
-    by Computer
-| extend RunningHours = round(HeartbeatCount / 60.0, 2)
-| extend RunningDays = round(HeartbeatCount / 1440.0, 2)
-| extend TotalHours = 90.0 * 24
-| extend TotalDays = 90
-| extend CurrentRunning = iff(LastHeartbeat >= ago(5m), "Running" , "Not Running")
-| project Computer,
-          FirstHeartbeat,
-          LastHeartbeat,
-		  CurrentRunning,
-          RunningHours,
-          RunningDays,
-          TotalHours,
-          TotalDays
-| sort by RunningHours asc
+	FirstHeartbeat=min(TimeGenerated),
+	LastHeartbeat=max(TimeGenerated)
+	by Computer
+| extend UptimeHours = round(datetime_diff('minute',LastHeartbeat, FirstHeartbeat)/60.0,2)
+|extend UptimeDays = round(UptimeHours/24.0,2)
+
+----------------------\
+|where Namespace == "Computer"
+|where Name == "Uptime"
+|summarize arg_max(TimeGenerated, Val) by Computer
+|project Computer, UptimeHours = round(Val / 3600, 2)
