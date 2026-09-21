@@ -1,15 +1,4 @@
-search *
-| where TimeGenerated >= ago(1h)
-| summarize Count=count() by $table
-| order by Count desc
-
-
-———-
-Heartbeat
-| where TimeGenerated >= ago(1h)
-| summarize
-    LastHeartbeat=max(TimeGenerated),
-    Count=count()
-    by Computer, OSType
+VMComputer
+| summarize arg_max(TimeGenerated, *) by Computer
+| project Computer, BootTime, OperatingSystemFamily, OperatingSystemFullName, TimeGenerated
 | order by Computer asc
-
