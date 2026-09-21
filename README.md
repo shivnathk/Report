@@ -1,4 +1,4 @@
-let HeartbeatData =
+let HB = 
     Heartbeat
     | where TimeGenerated >= ago(90d)
     | summarize
@@ -8,67 +8,55 @@ let HeartbeatData =
         OSType = any(OSType)
         by Computer;
 
-//
-// Windows boot time
-// Event ID 6005 = Event Log service started, normally occurring during boot
-//
-let WindowsBoot =
+let WinBoot =
     Event
     | where TimeGenerated >= ago(90d)
     | where EventID == 6005
-    | summarize LastBootTime = max(TimeGenerated) by Computer;
+    | summarize LastBootTime = max(TimeGenerated) by Computer
+    | extend OS = "Windows";
 
-//
-// Linux boot time
-// systemd writes "Startup finished" during system startup
-//
 let LinuxBoot =
     Syslog
     | where TimeGenerated >= ago(90d)
-    | where SyslogMessage has "Startup finished"
-    | summarize LastBootTime = max(TimeGenerated) by Computer;
+    | where SyslogMessage contains "Startup finished"
+    | summarize LastBootTime = max(TimeGenerated) by Computer
+    | extend OS = "Linux";
 
-//
-// Combine Windows and Linux boot information
-//
-let BootData =
-    union
-        (WindowsBoot | extend OS = "Windows"),
-        (LinuxBoot | extend OS = "Linux")
+let Boots =
+    union WinBoot, LinuxBoot
     | summarize LastBootTime = max(LastBootTime) by Computer, OS;
 
-HeartbeatData
-| join kind=leftouter BootData on Computer
-| extend CurrentlyRunning =
+HB
+| join kind=leftouter (
+    Boots
+) on Computer
+| extend CurrentlyRunning = 
     iff(LastHeartbeat >= ago(5m), "Running", "Not Running")
-| extend
-    UptimeHours =
-        iff(
-            CurrentlyRunning == "Running" and isnotnull(LastBootTime),
-            round((now() - LastBootTime) / 1h, 2),
-            real(null)
-        )
-| extend
-    UptimeDays =
-        iff(
-            CurrentlyRunning == "Running" and isnotnull(LastBootTime),
-            round((now() - LastBootTime) / 1d, 2),
-            real(null)
-        )
-| extend
-    Uptime =
-        iff(
-            CurrentlyRunning == "Running" and isnotnull(LastBootTime),
-            strcat(
-                toint((now() - LastBootTime) / 1d),
-                "d ",
-                toint(((now() - LastBootTime) % 1d) / 1h),
-                "h ",
-                toint(((now() - LastBootTime) % 1h) / 1m),
-                "m"
-            ),
-            "N/A"
-        )
+| extend UptimeHours =
+    iff(
+        CurrentlyRunning == "Running" and isnotnull(LastBootTime),
+        round(datetime_diff("minute", now(), LastBootTime) / 60.0, 2),
+        real(null)
+    )
+| extend UptimeDays =
+    iff(
+        CurrentlyRunning == "Running" and isnotnull(LastBootTime),
+        round(datetime_diff("minute", now(), LastBootTime) / 1440.0, 2),
+        real(null)
+    )
+| extend Uptime =
+    iff(
+        CurrentlyRunning == "Running" and isnotnull(LastBootTime),
+        strcat(
+            toint(datetime_diff("minute", now(), LastBootTime) / 1440),
+            "d ",
+            toint((datetime_diff("minute", now(), LastBootTime) % 1440) / 60),
+            "h ",
+            datetime_diff("minute", now(), LastBootTime) % 60,
+            "m"
+        ),
+        "N/A"
+    )
 | project
     Computer,
     OS,
@@ -80,4 +68,4 @@ HeartbeatData
     FirstHeartbeat,
     LastHeartbeat,
     HeartbeatCount
-| sort by UptimeHours asc
+| order by UptimeHours asc
