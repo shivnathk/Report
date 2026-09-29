@@ -65,3 +65,7 @@ Heartbeat
     ["First Heartbeat"] = FirstEverHeartbeat,
     ["Last Heartbeat"] = LastHeartbeat
 | order by ComputerName asc
+
+
+
+——————————————-
