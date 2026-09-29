@@ -1,67 +1,64 @@
 let EndTime = now();
 let StartTime = EndTime - 90d;
-let Bucket = 5m;
+let BucketSize = 5m;
 
-// All VMs seen during the 90-day period
-let VMs =
-    Heartbeat
-    | where TimeGenerated between (StartTime .. EndTime)
-    | extend ResourceId = tostring(_ResourceId)
-    | extend ResourceGroup = extract(
-        @"/resourceGroups/([^/]+)",
-        1,
-        ResourceId
-    )
-    | summarize by Computer, ResourceId, ResourceGroup;
-
-// Generate exactly 5-minute intervals for the complete 90 days
-let TimeBuckets =
-    range TimeGenerated from bin(StartTime, Bucket)
-        to bin(EndTime, Bucket)
-        step Bucket;
-
-// Heartbeat presence in each 5-minute interval
-let HB =
+// Get all VMs seen in the last 90 days
+let VMList = materialize(
     Heartbeat
     | where TimeGenerated between (StartTime .. EndTime)
     | extend
         ResourceId = tostring(_ResourceId),
-        TimeBucket = bin(TimeGenerated, Bucket)
-    | summarize HeartbeatCount = count()
-        by Computer, ResourceId, TimeBucket;
+        ResourceGroup = extract(@"/resourceGroups/([^/]+)", 1, tostring(_ResourceId))
+    | summarize by Computer, ResourceId, ResourceGroup
+);
 
-// Create complete VM × 5-minute interval matrix
-VMs
+// Generate 5-minute time buckets for the COMPLETE 90 days
+let TimeList = materialize(
+    range TimeGenerated from bin(StartTime, BucketSize)
+        to bin(EndTime, BucketSize)
+        step BucketSize
+);
+
+// Get heartbeat presence per VM per 5-minute bucket
+let Heartbeat5Min = materialize(
+    Heartbeat
+    | where TimeGenerated between (StartTime .. EndTime)
+    | extend
+        ResourceId = tostring(_ResourceId),
+        TimeBucket = bin(TimeGenerated, BucketSize)
+    | summarize HeartbeatCount = count()
+        by Computer, ResourceId, TimeBucket
+);
+
+// Create every VM × every 5-minute interval
+VMList
 | extend JoinKey = 1
 | join kind=inner (
-    TimeBuckets
+    TimeList
     | extend JoinKey = 1
 ) on JoinKey
 | project
     Computer,
     ResourceId,
     ResourceGroup,
-    TimeGenerated
+    TimeBucket = TimeGenerated
 | join kind=leftouter (
-    HB
+    Heartbeat5Min
 ) on
     Computer,
     ResourceId,
-    $left.TimeGenerated == $right.TimeBucket
-| extend HasHeartbeat = iff(isnotnull(HeartbeatCount), 1, 0)
+    TimeBucket
+| extend HasHeartbeat = iff(isnull(HeartbeatCount), 0, 1)
 | summarize
-    Total5MinIntervals = count(),
-    Uptime5MinIntervals = countif(HasHeartbeat == 1),
-    Downtime5MinIntervals = countif(HasHeartbeat == 0),
-    LastHeartbeat = maxif(TimeGenerated, HasHeartbeat == 1)
+    TotalIntervals = count(),
+    UptimeIntervals = countif(HasHeartbeat == 1),
+    DowntimeIntervals = countif(HasHeartbeat == 0),
+    LastHeartbeat = maxif(TimeBucket, HasHeartbeat == 1)
     by Computer, ResourceGroup, ResourceId
 | extend
-    ["Total Uptime Hrs"] =
-        round(Uptime5MinIntervals * 5.0 / 60.0, 2),
-    ["Total Downtime Hrs"] =
-        round(Downtime5MinIntervals * 5.0 / 60.0, 2),
-    ["5 Min Duration"] =
-        strcat(Total5MinIntervals * 5, " min"),
+    ["Total Uptime Hrs"] = round(UptimeIntervals * 5.0 / 60.0, 2),
+    ["Total Downtime Hrs"] = round(DowntimeIntervals * 5.0 / 60.0, 2),
+    ["5 Min Duration"] = strcat(TotalIntervals * 5, " min"),
     ["Current Running Status"] =
         iff(LastHeartbeat >= EndTime - 10m, "Running", "Not Running")
 | project
