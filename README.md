@@ -1,77 +1,75 @@
-let Lookback = 90d;
-let HeartbeatInterval = 1m;
-let StopThreshold = 5m;
+let EndTime = now();
+let StartTime = EndTime - 90d;
+let Bucket = 5m;
 
-// Get all heartbeats in the last 90 days
-Heartbeat
-| where TimeGenerated >= ago(Lookback)
-| project Computer, TimeGenerated
-| sort by Computer asc, TimeGenerated asc
-
-// Find the previous heartbeat for each VM
-| serialize
-| extend PreviousHeartbeat = prev(TimeGenerated)
-| extend PreviousComputer = prev(Computer)
-
-// Identify the start of a new running period
-| extend NewRun =
-    iff(
-        Computer != PreviousComputer
-        or isempty(PreviousHeartbeat)
-        or TimeGenerated - PreviousHeartbeat > StopThreshold,
+// All VMs seen during the 90-day period
+let VMs =
+    Heartbeat
+    | where TimeGenerated between (StartTime .. EndTime)
+    | extend ResourceId = tostring(_ResourceId)
+    | extend ResourceGroup = extract(
+        @"/resourceGroups/([^/]+)",
         1,
-        0
+        ResourceId
     )
+    | summarize by Computer, ResourceId, ResourceGroup;
 
-// Create a running-period ID
-| extend RunId = row_cumsum(NewRun)
+// Generate exactly 5-minute intervals for the complete 90 days
+let TimeBuckets =
+    range TimeGenerated from bin(StartTime, Bucket)
+        to bin(EndTime, Bucket)
+        step Bucket;
 
-// Calculate each running period
-| summarize
-    RunStart = min(TimeGenerated),
-    RunEnd = max(TimeGenerated),
-    Heartbeats = count()
-    by Computer, RunId
+// Heartbeat presence in each 5-minute interval
+let HB =
+    Heartbeat
+    | where TimeGenerated between (StartTime .. EndTime)
+    | extend
+        ResourceId = tostring(_ResourceId),
+        TimeBucket = bin(TimeGenerated, Bucket)
+    | summarize HeartbeatCount = count()
+        by Computer, ResourceId, TimeBucket;
 
-// A heartbeat period represents actual observed running time.
-// Add the heartbeat interval to the last heartbeat so the final
-// heartbeat contributes to the running interval.
-| extend RunEndWithInterval = RunEnd + HeartbeatInterval
-
-// Do not allow the calculated interval to extend beyond "now"
-| extend RunEndWithInterval =
-    iff(RunEndWithInterval > now(), now(), RunEndWithInterval)
-
-// Calculate uptime for each individual running period
-| extend RunningHours =
-    datetime_diff("second", RunEndWithInterval, RunStart) / 3600.0
-
-// Summarize all running periods for each VM
-| summarize
-    FirstHeartbeat = min(RunStart),
-    LastHeartbeat = max(RunEnd),
-    RunningHours = round(sum(RunningHours), 2),
-    RunningDays = round(sum(RunningHours) / 24.0, 2),
-    RunningPeriods = count()
-    by Computer
-
-// Calculate total observation period
-| extend TotalHours = round(datetime_diff("hour", now(), ago(Lookback)) * -1.0, 2)
-| extend TotalDays = round(TotalHours / 24.0, 2)
-
-// Current state
-| extend CurrentRunning =
-    iff(LastHeartbeat >= ago(StopThreshold), "Running", "Not Running")
-
+// Create complete VM × 5-minute interval matrix
+VMs
+| extend JoinKey = 1
+| join kind=inner (
+    TimeBuckets
+    | extend JoinKey = 1
+) on JoinKey
 | project
     Computer,
-    FirstHeartbeat,
-    LastHeartbeat,
-    CurrentRunning,
-    RunningPeriods,
-    RunningHours,
-    RunningDays,
-    TotalHours,
-    TotalDays
-
-| sort by RunningHours asc
+    ResourceId,
+    ResourceGroup,
+    TimeGenerated
+| join kind=leftouter (
+    HB
+) on
+    Computer,
+    ResourceId,
+    $left.TimeGenerated == $right.TimeBucket
+| extend HasHeartbeat = iff(isnotnull(HeartbeatCount), 1, 0)
+| summarize
+    Total5MinIntervals = count(),
+    Uptime5MinIntervals = countif(HasHeartbeat == 1),
+    Downtime5MinIntervals = countif(HasHeartbeat == 0),
+    LastHeartbeat = maxif(TimeGenerated, HasHeartbeat == 1)
+    by Computer, ResourceGroup, ResourceId
+| extend
+    ["Total Uptime Hrs"] =
+        round(Uptime5MinIntervals * 5.0 / 60.0, 2),
+    ["Total Downtime Hrs"] =
+        round(Downtime5MinIntervals * 5.0 / 60.0, 2),
+    ["5 Min Duration"] =
+        strcat(Total5MinIntervals * 5, " min"),
+    ["Current Running Status"] =
+        iff(LastHeartbeat >= EndTime - 10m, "Running", "Not Running")
+| project
+    ComputerName = Computer,
+    ResourceGroup,
+    ["Current Running Status"],
+    ["Total Uptime Hrs"],
+    ["Total Downtime Hrs"],
+    ["5 Min Duration"],
+    LastHeartbeat
+| order by ComputerName asc
