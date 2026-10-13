@@ -68,4 +68,79 @@ Heartbeat
 
 
 
-——————————————-
+——————————————daily hearbeat sum___________________
+
+Heartbeat
+| extend
+    VMName = tostring(split(tostring(_ResourceId), "/")[-1]),
+    ResourceId = tostring(_ResourceId),
+    ResourceGroup = extract(
+        @"/resourceGroups/([^/]+)",
+        1,
+        tostring(_ResourceId)
+    )
+| summarize
+    FirstEverHeartbeat = min(TimeGenerated)
+    by VMName, ResourceId, ResourceGroup
+| join kind=inner (
+    Heartbeat
+    | where TimeGenerated between (ago(90d) .. now())
+    | extend
+        VMName = tostring(split(tostring(_ResourceId), "/")[-1]),
+        ResourceId = tostring(_ResourceId),
+        ResourceGroup = extract(
+            @"/resourceGroups/([^/]+)",
+            1,
+            tostring(_ResourceId)
+        ),
+        Day = startofday(TimeGenerated)
+    | summarize
+        FirstHeartbeatOfDay = min(TimeGenerated),
+        LastHeartbeatOfDay = max(TimeGenerated)
+        by VMName, ResourceId, ResourceGroup, Day
+    | extend
+        UptimeMinutes =
+            datetime_diff(
+                'minute',
+                LastHeartbeatOfDay,
+                FirstHeartbeatOfDay
+            )
+) on VMName, ResourceId, ResourceGroup
+| summarize
+    FirstEverHeartbeat = min(FirstEverHeartbeat),
+    LastHeartbeat = max(LastHeartbeatOfDay),
+    TotalUptimeMinutes = sum(UptimeMinutes)
+    by VMName, ResourceId, ResourceGroup
+| extend
+    MeasurementStart =
+        iff(
+            FirstEverHeartbeat > ago(90d),
+            FirstEverHeartbeat,
+            ago(90d)
+        )
+| extend
+    MeasurementMinutes =
+        datetime_diff(
+            'minute',
+            now(),
+            MeasurementStart
+        )
+| extend
+    TotalDowntimeMinutes =
+        MeasurementMinutes - TotalUptimeMinutes
+| extend
+    ["Total Uptime Hrs"] =
+        round(TotalUptimeMinutes / 60.0, 2),
+    ["Total Downtime Hrs"] =
+        round(TotalDowntimeMinutes / 60.0, 2),
+    ["Current Running Status"] =
+        iff(LastHeartbeat >= ago(10m), "Running", "Not Running")
+| project
+    VMName,
+    ResourceGroup,
+    ["Current Running Status"],
+    ["Total Uptime Hrs"],
+    ["Total Downtime Hrs"],
+    ["First Heartbeat"] = FirstEverHeartbeat,
+    ["Last Heartbeat"] = LastHeartbeat
+| order by VMName asc
